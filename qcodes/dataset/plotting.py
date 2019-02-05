@@ -1,21 +1,22 @@
 import logging
 from collections import OrderedDict
 from functools import partial
-from typing import Optional, List, Sequence, Union, Tuple, Dict, Any, Set
+from typing import (Optional, List, Sequence, Union, Tuple, Dict,
+                    Any, Set)
 import inspect
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+from contextlib import contextmanager
 
 import qcodes as qc
 from qcodes.dataset.data_set import load_by_id
-from qcodes.utils.plotting import auto_range_iqr
-from qcodes import config
+from qcodes.utils.plotting import auto_color_scale_from_config
 
-from .data_export import get_data_by_id, flatten_1D_data_for_plot
-from .data_export import (plottype_for_2d_data,
-                          plottype_for_3d_data, reshape_2D_data)
+from .data_export import (get_data_by_id, flatten_1D_data_for_plot,
+                          get_1D_plottype, get_2D_plottype, reshape_2D_data,
+                          _strings_as_ints)
 
 log = logging.getLogger(__name__)
 DB = qc.config["core"]["db_location"]
@@ -23,6 +24,7 @@ DB = qc.config["core"]["db_location"]
 AxesTuple = Tuple[matplotlib.axes.Axes, matplotlib.colorbar.Colorbar]
 AxesTupleList = Tuple[List[matplotlib.axes.Axes],
                       List[Optional[matplotlib.colorbar.Colorbar]]]
+Number = Union[float, int]
 
 # list of kwargs for plotting function, so that kwargs can be passed to
 # :meth:`plot_by_id` and will be distributed to the respective plotting func.
@@ -35,6 +37,47 @@ FIGURE_KWARGS = set(inspect.signature(plt.figure).parameters.keys())
 FIGURE_KWARGS.remove('kwargs')
 SUBPLOTS_KWARGS = SUBPLOTS_OWN_KWARGS.union(FIGURE_KWARGS)
 
+
+@contextmanager
+def _appropriate_kwargs(plottype: str,
+                        colorbar_present: bool,
+                        **kwargs):
+    """
+    NB: Only to be used inside :meth"`plot_by_id`.
+
+    Context manager to temporarily mutate the plotting kwargs to be appropriate
+    for a specific plottype. This is helpful since :meth:`plot_by_id` may have
+    to generate different kinds of plots (e.g. heatmaps and line plots) and
+    the user may want to specify kwargs only relevant to some of them
+    (e.g. 'cmap', that line plots cannot consume). Those kwargs should then not
+    be passed to all plots, which is what this contextmanager handles.
+
+    Args:
+        plottype: The plot type for which the kwargs should be adjusted
+        colorbar_present: Is there a non-None colorbar in this plot iteration?
+    """
+
+    def linehandler(**kwargs):
+        kwargs.pop('cmap', None)
+        return kwargs
+
+    def heatmaphandler(**kwargs):
+        if not(colorbar_present) and 'cmap' not in kwargs:
+            kwargs['cmap'] = qc.config.plotting.default_color_map
+        return kwargs
+
+    plot_handler_mapping = {'1D_line': linehandler,
+                            '1D_point': linehandler,
+                            '1D_bar': linehandler,
+                            '2D_point': heatmaphandler,
+                            '2D_grid': heatmaphandler,
+                            '2D_scatter': heatmaphandler,
+                            '2D_equidistant': heatmaphandler,
+                            '2D_unknown': heatmaphandler}
+
+    yield plot_handler_mapping[plottype](**kwargs.copy())
+
+
 def plot_by_id(run_id: int,
                axes: Optional[Union[matplotlib.axes.Axes,
                               Sequence[matplotlib.axes.Axes]]]=None,
@@ -42,7 +85,8 @@ def plot_by_id(run_id: int,
                                    Sequence[
                                        matplotlib.colorbar.Colorbar]]]=None,
                rescale_axes: bool=True,
-               smart_colorscale: Optional[bool]=None,
+               auto_color_scale: Optional[bool]=None,
+               cutoff_percentile: Optional[Union[Tuple[Number, Number], Number]]=None,
                **kwargs) -> AxesTupleList:
     """
     Construct all plots for a given run
@@ -62,6 +106,11 @@ def plot_by_id(run_id: int,
     The plot has a title that comprises run id, experiment name, and sample
     name.
 
+    ``**kwargs`` are passed to matplotlib's relevant plotting functions
+    By default the data in any vector plot will be rasterized
+    for scatter plots and heatmaps if more that 5000 points are supplied.
+    This can be overridden by supplying the `rasterized` kwarg.
+
     Args:
         run_id:
             ID of the run to plot
@@ -75,20 +124,22 @@ def plot_by_id(run_id: int,
             with standard SI units will be rescaled so that, for example,
             '0.00000005' tick label on 'V' axis are transformed to '50' on 'nV'
             axis ('n' is 'nano')
-        smart_colorscale: if True, the colorscale of heatmap plots will be
-            automatically adjusted to disregard outliers. If False,
-            the adjustment will not be performed. If None, the value from
-            QCoDeS config->"gui"->"smart_colorscale" will determine if the
-            adjustment is going to be performed.
+        auto_color_scale: if True, the colorscale of heatmap plots will be
+            automatically adjusted to disregard outliers.
+        cutoff_percentile: percentile of data that may maximally be clipped
+            on both sides of the distribution.
+            If given a tuple (a,b) the percentile limits will be a and 100-b.
+            See also the plotting tuorial notebook.
 
     Returns:
         a list of axes and a list of colorbars of the same length. The
         colorbar axes may be None if no colorbar is created (e.g. for
         1D plots)
+
+    Config dependencies: (qcodesrc.json)
     """
+
     # handle arguments and defaults
-    if smart_colorscale is None:
-        smart_colorscale = config.gui.smart_colorscale
     subplots_kwargs = {k: kwargs.pop(k)
                        for k in set(kwargs).intersection(SUBPLOTS_KWARGS)}
 
@@ -128,22 +179,31 @@ def plot_by_id(run_id: int,
     for data, ax, colorbar in zip(alldata, axes, colorbars):
 
         if len(data) == 2:  # 1D PLOTTING
-            log.debug('Plotting by id, doing a 1D plot')
+            log.debug(f'Doing a 1D plot with kwargs: {kwargs}')
 
             xpoints = data[0]['data']
             ypoints = data[1]['data']
 
-            plottype = plottype_for_2d_data(xpoints, ypoints)
+            plottype = get_1D_plottype(xpoints, ypoints)
+            log.debug(f'Determined plottype: {plottype}')
 
-            if plottype == 'line':
+            if plottype == '1D_line':
                 # sort for plotting
                 order = xpoints.argsort()
                 xpoints = xpoints[order]
                 ypoints = ypoints[order]
 
-                ax.plot(xpoints, ypoints, **kwargs)
-            elif plottype == 'point':
-                ax.scatter(xpoints, ypoints, **kwargs)
+                with _appropriate_kwargs(plottype,
+                                         colorbar is not None, **kwargs) as k:
+                    ax.plot(xpoints, ypoints, **k)
+            elif plottype == '1D_point':
+                with _appropriate_kwargs(plottype,
+                                         colorbar is not None, **kwargs) as k:
+                    ax.scatter(xpoints, ypoints, **k)
+            elif plottype == '1D_bar':
+                with _appropriate_kwargs(plottype,
+                                         colorbar is not None, **kwargs) as k:
+                    ax.bar(xpoints, ypoints, **k)
             else:
                 raise ValueError('Unknown plottype. Something is way wrong.')
 
@@ -157,34 +217,39 @@ def plot_by_id(run_id: int,
             ax.set_title(title)
 
         elif len(data) == 3:  # 2D PLOTTING
-            log.debug('Plotting by id, doing a 2D plot')
+            log.debug(f'Doing a 2D plot with kwargs: {kwargs}')
 
             # From the setpoints, figure out which 2D plotter to use
             # TODO: The "decision tree" for what gets plotted how and how
             # we check for that is still unfinished/not optimised
 
-            how_to_plot = {'grid': plot_on_a_plain_grid,
-                           'equidistant': plot_on_a_plain_grid,
-                           'point': plot_2d_scatterplot,
-                           'unknown': plot_2d_scatterplot}
-
             xpoints = flatten_1D_data_for_plot(data[0]['data'])
             ypoints = flatten_1D_data_for_plot(data[1]['data'])
             zpoints = flatten_1D_data_for_plot(data[2]['data'])
 
-            plottype = plottype_for_3d_data(xpoints, ypoints, zpoints)
+            plottype = get_2D_plottype(xpoints, ypoints, zpoints)
 
+            log.debug(f'Determined plottype: {plottype}')
+
+            how_to_plot = {'2D_grid': plot_on_a_plain_grid,
+                           '2D_equidistant': plot_on_a_plain_grid,
+                           '2D_point': plot_2d_scatterplot,
+                           '2D_unknown': plot_2d_scatterplot}
             plot_func = how_to_plot[plottype]
-            ax, colorbar = plot_func(xpoints, ypoints, zpoints, ax, colorbar,
-                                     **kwargs)
+
+            with _appropriate_kwargs(plottype,
+                                     colorbar is not None, **kwargs) as k:
+                ax, colorbar = plot_func(xpoints, ypoints, zpoints,
+                                         ax, colorbar,
+                                         **k)
 
             _set_data_axes_labels(ax, data, colorbar)
 
             if rescale_axes:
                 _rescale_ticks_and_units(ax, data, colorbar)
 
-            if smart_colorscale:
-                colorbar.mappable.set_clim(*auto_range_iqr(zpoints))
+            auto_color_scale_from_config(colorbar, auto_color_scale,
+                                         zpoints, cutoff_percentile)
 
             new_colorbars.append(colorbar)
 
@@ -237,7 +302,10 @@ def plot_2d_scatterplot(x: np.ndarray, y: np.ndarray, z: np.ndarray,
                         colorbar: matplotlib.colorbar.Colorbar=None,
                         **kwargs) -> AxesTuple:
     """
-    Make a 2D scatterplot of the data
+    Make a 2D scatterplot of the data. ``**kwargs`` are passed to matplotlib's
+    scatter used for the plotting. By default the data will be rasterized
+    in any vector plot if more that 5000 points are supplied. This can be
+    overridden by supplying the `rasterized` kwarg.
 
     Args:
         x: The x values
@@ -249,21 +317,36 @@ def plot_2d_scatterplot(x: np.ndarray, y: np.ndarray, z: np.ndarray,
     Returns:
         The matplotlib axis handles for plot and colorbar
     """
-    z_is_string_valued = isinstance(z[0], str)
-
-    if z_is_string_valued:
-        z_int = list(range(len(z)))
-        mappable = ax.scatter(x=x, y=y, c=z_int, **kwargs)
+    if 'rasterized' in kwargs.keys():
+        rasterized = kwargs.pop('rasterized')
     else:
-        mappable = ax.scatter(x=x, y=y, c=z, **kwargs)
+        rasterized = len(z) > qc.config.plotting.rasterize_threshold
+
+    z_is_stringy = isinstance(z[0], str)
+
+    if z_is_stringy:
+        z_strings = np.unique(z)
+        z = _strings_as_ints(z)
+
+    cmap = kwargs.pop('cmap') if 'cmap' in kwargs else None
+
+    if z_is_stringy:
+        name = cmap.name if hasattr(cmap, 'name') else 'viridis'
+        cmap = matplotlib.cm.get_cmap(name, len(z_strings))
+
+    mappable = ax.scatter(x=x, y=y, c=z,
+                          rasterized=rasterized, cmap=cmap, **kwargs)
 
     if colorbar is not None:
         colorbar = ax.figure.colorbar(mappable, ax=ax, cax=colorbar.ax)
     else:
         colorbar = ax.figure.colorbar(mappable, ax=ax)
 
-    if z_is_string_valued:
-        colorbar.ax.set_yticklabels(z)
+    if z_is_stringy:
+        N = len(z_strings)
+        f = (N-1)/N
+        colorbar.set_ticks([(n+0.5)*f for n in range(N)])
+        colorbar.set_ticklabels(z_strings)
 
     return ax, colorbar
 
@@ -282,7 +365,10 @@ def plot_on_a_plain_grid(x: np.ndarray,
     way, but data must belong together such that z[n] has x[n] and
     y[n] as setpoints.  The setpoints need not be equidistantly
     spaced, but linear interpolation is used to find the edges of the
-    plotted squares.
+    plotted squares. ``**kwargs`` are passed to matplotlib's pcolormesh used
+    for the plotting. By default the data in any vector plot will be rasterized
+    if more that 5000 points are supplied. This can be overridden
+    by supplying the `rasterized` kwarg.
 
     Args:
         x: The x values
@@ -294,6 +380,24 @@ def plot_on_a_plain_grid(x: np.ndarray,
     Returns:
         The matplotlib axes handle for plot and colorbar
     """
+
+    log.debug(f'Got kwargs: {kwargs}')
+
+    x_is_stringy = isinstance(x[0], str)
+    y_is_stringy = isinstance(y[0], str)
+    z_is_stringy = isinstance(z[0], str)
+
+    if x_is_stringy:
+        x_strings = np.unique(x)
+        x = _strings_as_ints(x)
+
+    if y_is_stringy:
+        y_strings = np.unique(y)
+        y = _strings_as_ints(y)
+
+    if z_is_stringy:
+        z_strings = np.unique(z)
+        z = _strings_as_ints(z)
 
     xrow, yrow, z_to_plot = reshape_2D_data(x, y, z)
 
@@ -308,14 +412,43 @@ def plot_on_a_plain_grid(x: np.ndarray,
     y_edges = np.concatenate((np.array([yrow[0] - dys[0]]),
                               yrow[:-1] + dys,
                               np.array([yrow[-1] + dys[-1]])))
+    if 'rasterized' in kwargs.keys():
+        rasterized = kwargs.pop('rasterized')
+    else:
+        rasterized = len(x_edges) * len(y_edges) \
+                      > qc.config.plotting.rasterize_threshold
+
+    cmap = kwargs.pop('cmap') if 'cmap' in kwargs else None
+
+    if z_is_stringy:
+        name = cmap.name if hasattr(cmap, 'name') else 'viridis'
+        cmap = matplotlib.cm.get_cmap(name, len(z_strings))
 
     colormesh = ax.pcolormesh(x_edges, y_edges,
                               np.ma.masked_invalid(z_to_plot),
+                              rasterized=rasterized,
+                              cmap=cmap,
                               **kwargs)
+
+    if x_is_stringy:
+        ax.set_xticks(np.arange(len(np.unique(x_strings))))
+        ax.set_xticklabels(x_strings)
+
+    if y_is_stringy:
+        ax.set_yticks(np.arange(len(np.unique(y_strings))))
+        ax.set_yticklabels(y_strings)
+
     if colorbar is not None:
         colorbar = ax.figure.colorbar(colormesh, ax=ax, cax=colorbar.ax)
     else:
         colorbar = ax.figure.colorbar(colormesh, ax=ax)
+
+    if z_is_stringy:
+        N = len(z_strings)
+        f = (N-1)/N
+        colorbar.set_ticks([(n+0.5)*f for n in range(N)])
+        colorbar.set_ticklabels(z_strings)
+
     return ax, colorbar
 
 
