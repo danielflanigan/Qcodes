@@ -2,15 +2,20 @@ import collections
 import logging
 import time
 from functools import partial
-from warnings import warn
+from typing import Union, Iterable, Callable
+import numbers
 
 import numpy as np
 
 from qcodes import Instrument, IPInstrument, InstrumentChannel
+from qcodes.utils.deprecate import deprecate
 from qcodes.math.field_vector import FieldVector
 from qcodes.utils.validators import Bool, Numbers, Ints, Anything
 
 log = logging.getLogger(__name__)
+
+CartesianFieldLimitFunction = \
+    Callable[[numbers.Real, numbers.Real, numbers.Real], bool]
 
 
 class AMI430Exception(Exception):
@@ -110,13 +115,13 @@ class AMI430(IPInstrument):
     Driver for the American Magnetics Model 430 magnet power supply programmer.
 
     This class controls a single magnet power supply. In order to use two or
-    three magnets simultaniously to set field vectors, first instantiate the
+    three magnets simultaneously to set field vectors, first instantiate the
     individual magnets using this class and then pass them as arguments to
     either the AMI430_2D or AMI430_3D virtual instrument classes.
 
     Args:
-        name (string): a name for the instrument
-        address (string): IP address of the power supply programmer
+        name (str): a name for the instrument
+        address (str): IP address of the power supply programmer
         current_ramp_limit: A current ramp limit, in units of A/s
     """
     _SHORT_UNITS = {'seconds': 's', 'minutes': 'min',
@@ -152,7 +157,7 @@ class AMI430(IPInstrument):
                            val_mapping={'kilogauss': 0,
                                         'tesla': 1})
 
-        # Set programatic safety limits
+        # Set programmatic safety limits
         self.add_parameter('current_ramp_limit',
                            get_cmd=lambda: self._current_ramp_limit,
                            set_cmd=self._update_ramp_rate_limit,
@@ -176,7 +181,7 @@ class AMI430(IPInstrument):
 
         # TODO: Not all AMI430s expose this setting. Currently, we
         # don't know why, but this most likely a firmware version issue,
-        # so eventually the following condition will be smth like
+        # so eventually the following condition will be something like
         # if firmware_version > XX
         if has_current_rating:
             self.add_parameter('current_rating',
@@ -341,12 +346,9 @@ class AMI430(IPInstrument):
             msg = '_set_field({}) failed with state: {}'
             raise AMI430Exception(msg.format(value, state))
 
+    @deprecate(alternative='set_field with named parameter block=False')
     def ramp_to(self, value, block=False):
-        """ User accessible method to ramp to field """
-        # This function duplicates set_field, let's deprecate it...
-        warn("This method is deprecated."
-             " Use set_field with named parameter block=False instead.",
-             DeprecationWarning)
+        """User accessible method to ramp to field."""
         if self._parent_instrument is not None:
             if not block:
                 msg = (": Initiating a blocking instead of non-blocking "
@@ -388,24 +390,6 @@ class AMI430(IPInstrument):
         The value passed here is scaled by the units set in
         self.ramp_rate_units
         """
-        # Warn if we are going above the default
-        warn_level = AMI430._DEFAULT_CURRENT_RAMP_LIMIT
-        if new_current_rate_limit > AMI430._DEFAULT_CURRENT_RAMP_LIMIT:
-            warning_message = ("Increasing maximum ramp rate: we have a "
-                               "default current ramp rate limit of "
-                               "{} {}".format(warn_level,
-                                              self.current_ramp_limit.unit) +
-                               ". We do not want to ramp faster than a set "
-                               "maximum so as to avoid quenching "
-                               "the magnet. A value of "
-                               "{} {}".format(warn_level,
-                                              self.current_ramp_limit.unit) +
-                               " seems like a safe, conservative value for"
-                               " any magnet. Change this value at your own "
-                               "responsibility after consulting the specs of "
-                               "your particular magnet")
-            warn(warning_message, category=AMI430Warning)
-
         # Update ramp limit
         self._current_ramp_limit = new_current_rate_limit
         # And update instrument limits
@@ -427,8 +411,9 @@ class AMI430(IPInstrument):
             self.write("CONF:COIL {}".format(new_coil_constant))
 
         # Update scaling factors
+        self.field_ramp_limit.scale = 1/new_coil_constant
+        self.field_limit.scale = 1/new_coil_constant
         if self.has_current_rating:
-            self.field_ramp_limit.scale = 1/new_coil_constant
             self.field_rating.scale = 1/new_coil_constant
 
         # Return new coil constant
@@ -440,12 +425,13 @@ class AMI430(IPInstrument):
             ramp_rate_units = self.ramp_rate_units()
         else:
             self.write("CONF:RAMP:RATE:UNITS {}".format(ramp_rate_units))
-            ramp_rate_units = self.ramp_rate_units.val_mapping[ramp_rate_units]
+            ramp_rate_units = self.ramp_rate_units.\
+                inverse_val_mapping[ramp_rate_units]
         if field_units is None:
             field_units = self.field_units()
         else:
             self.write("CONF:FIELD:UNITS {}".format(field_units))
-            field_units = self.field_units.val_mapping[field_units]
+            field_units = self.field_units.inverse_val_mapping[field_units]
 
         # Map to shortened unit names
         ramp_rate_units = AMI430._SHORT_UNITS[ramp_rate_units]
@@ -462,18 +448,27 @@ class AMI430(IPInstrument):
 
         # And update scaling factors
         # Note: we don't update field_ramp_limit scale as it redirects
-        #       to ramp_rate_limit we don't update ramp_rate units as
+        #       to ramp_rate_limit; we don't update ramp_rate units as
         #       the instrument stores changed units
         if ramp_rate_units == "min":
             self.current_ramp_limit.scale = 1/60
         else:
             self.current_ramp_limit.scale = 1
-        self._update_coil_constant()
+
+        # If the field units change, the value of the coil constant also
+        # changes, hence we read the new value of the coil constant from the
+        # instrument via the `coil_constant` parameter (which in turn also
+        # updates settings of some parameters due to the fact that the coil
+        # constant changes)
+        self.coil_constant()
 
 
 class AMI430_3D(Instrument):
-    def __init__(self, name, instrument_x, instrument_y,
-                 instrument_z, field_limit, **kwargs):
+    def __init__(self, name,
+                 instrument_x, instrument_y, instrument_z,
+                 field_limit: Union[numbers.Real,
+                                    Iterable[CartesianFieldLimitFunction]],
+                 **kwargs):
         super().__init__(name, **kwargs)
 
         if not isinstance(name, str):
@@ -490,11 +485,15 @@ class AMI430_3D(Instrument):
         self._instrument_y = instrument_y
         self._instrument_z = instrument_z
 
-        if repr(field_limit).isnumeric() or isinstance(field_limit, collections.abc.Iterable):
+        self._field_limit: Union[float, Iterable[CartesianFieldLimitFunction]]
+        if isinstance(field_limit, collections.abc.Iterable):
             self._field_limit = field_limit
+        elif isinstance(field_limit, numbers.Real):
+            # Conversion to float makes related driver logic simpler
+            self._field_limit = float(field_limit)
         else:
-            raise ValueError("field limit should either be"
-                             " a number or an iterable")
+            raise ValueError("field limit should either be a number or "
+                             "an iterable of callable field limit functions.")
 
         self._set_point = FieldVector(
             x=self._instrument_x.field(),
@@ -667,8 +666,7 @@ class AMI430_3D(Instrument):
         )
 
     def _verify_safe_setpoint(self, setpoint_values):
-
-        if repr(self._field_limit).isnumeric():
+        if isinstance(self._field_limit, float):
             return np.linalg.norm(setpoint_values) < self._field_limit
 
         answer = any([limit_function(*setpoint_values) for
@@ -791,4 +789,3 @@ class AMI430_3D(Instrument):
         )
 
         self._set_point = set_point
-

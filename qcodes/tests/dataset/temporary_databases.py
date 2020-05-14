@@ -1,4 +1,5 @@
 import tempfile
+import gc
 import os
 from contextlib import contextmanager
 import shutil
@@ -6,41 +7,77 @@ import shutil
 import pytest
 
 import qcodes as qc
-from qcodes.dataset.database import initialise_database
+from qcodes.dataset.sqlite.database import initialise_database, connect
 from qcodes import new_experiment, new_data_set
-from qcodes.dataset.sqlite_base import connect
+
 
 n_experiments = 0
 
 
 @pytest.fixture(scope="function")
-def empty_temp_db():
+def empty_temp_db(tmp_path):
     global n_experiments
     n_experiments = 0
     # create a temp database for testing
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        qc.config["core"]["db_location"] = os.path.join(tmpdirname, 'temp.db')
-        qc.config["core"]["db_debug"] = True
+    try:
+        qc.config["core"]["db_location"] = \
+            str(tmp_path / 'temp.db')
+        if os.environ.get('QCODES_SQL_DEBUG'):
+            qc.config["core"]["db_debug"] = True
+        else:
+            qc.config["core"]["db_debug"] = False
         initialise_database()
         yield
+    finally:
+        # there is a very real chance that the tests will leave open
+        # connections to the database. These will have gone out of scope at
+        # this stage but a gc collection may not have run. The gc
+        # collection ensures that all connections belonging to now out of
+        # scope objects will be closed
+        gc.collect()
 
 
 @pytest.fixture(scope='function')
-def two_empty_temp_db_connections():
+def empty_temp_db_connection(tmp_path):
     """
-    Yield the paths of two empty files. Meant for use with the
-    test_database_copy_paste
+    Yield connection to an empty temporary DB file.
     """
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        source_path = os.path.join(tmpdirname, 'source.db')
-        target_path = os.path.join(tmpdirname, 'target.db')
-        source_conn = connect(source_path)
-        target_conn = connect(target_path)
-        try:
-            yield (source_conn, target_conn)
-        finally:
-            source_conn.close()
-            target_conn.close()
+    path = str(tmp_path / 'source.db')
+    conn = connect(path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+        # there is a very real chance that the tests will leave open
+        # connections to the database. These will have gone out of scope at
+        # this stage but a gc collection may not have run. The gc
+        # collection ensures that all connections belonging to now out of
+        # scope objects will be closed
+        gc.collect()
+
+
+@pytest.fixture(scope='function')
+def two_empty_temp_db_connections(tmp_path):
+    """
+    Yield connections to two empty files. Meant for use with the
+    test_database_extract_runs
+    """
+
+    source_path = str(tmp_path / 'source.db')
+    target_path = str(tmp_path / 'target.db')
+    source_conn = connect(source_path)
+    target_conn = connect(target_path)
+    try:
+        yield (source_conn, target_conn)
+    finally:
+        source_conn.close()
+        target_conn.close()
+        # there is a very real chance that the tests will leave open
+        # connections to the database. These will have gone out of scope at
+        # this stage but a gc collection may not have run. The gc
+        # collection ensures that all connections belonging to now out of
+        # scope objects will be closed
+        gc.collect()
 
 
 @pytest.fixture(scope='function')
